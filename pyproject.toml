@@ -1,0 +1,15 @@
+[project]
+name = "reschene"
+version = "0.1.0"
+description = "Image management system with EXIF extraction, Athena search, and 3D reconstruction pipeline"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aws-cdk-lib>=2.180.0",
+    "constructs>=10.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
