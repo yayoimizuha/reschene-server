@@ -117,7 +117,6 @@ class RescheneStack(cdk.Stack):
             self,
             "ImageBucket",
             bucket_name="reschene-userimage",
-            versioned=True,
             encryption=s3.BucketEncryption.S3_MANAGED,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             cors=[
@@ -127,11 +126,6 @@ class RescheneStack(cdk.Stack):
                     allowed_headers=["*"],
                     max_age=3600,
                 )
-            ],
-            lifecycle_rules=[
-                s3.LifecycleRule(
-                    noncurrent_version_expiration=cdk.Duration.days(1),
-                ),
             ],
             removal_policy=cdk.RemovalPolicy.DESTROY,
             auto_delete_objects=True,
@@ -293,19 +287,20 @@ class RescheneStack(cdk.Stack):
             "ReconstructionVpc",
             vpc_name="reschene-reconstruction-vpc",
             max_azs=2,
-            nat_gateways=1,
+            nat_gateways=0,
             subnet_configuration=[
                 ec2.SubnetConfiguration(
                     name="Public",
                     subnet_type=ec2.SubnetType.PUBLIC,
                     cidr_mask=24,
                 ),
-                ec2.SubnetConfiguration(
-                    name="Private",
-                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
-                    cidr_mask=24,
-                ),
             ],
+        )
+
+        # S3 Gateway VPC Endpoint - allows ECS tasks to reach S3 without NAT or public IP
+        vpc.add_gateway_endpoint(
+            "S3Endpoint",
+            service=ec2.GatewayVpcEndpointAwsService.S3,
         )
 
         ecs_security_group = ec2.SecurityGroup(
@@ -353,7 +348,7 @@ class RescheneStack(cdk.Stack):
             self,
             "GpuAsg",
             vpc=vpc,
-            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
             launch_template=launch_template,
             min_capacity=0,
             max_capacity=2,
@@ -417,7 +412,7 @@ class RescheneStack(cdk.Stack):
                 "RECONSTRUCTION_THRESHOLD": "50",
                 "ECS_CLUSTER_ARN": cluster.cluster_arn,
                 "ECS_TASK_DEFINITION_ARN": task_definition.task_definition_arn,
-                "ECS_SUBNET_IDS": ",".join([s.subnet_id for s in vpc.private_subnets]),
+                "ECS_SUBNET_IDS": ",".join([s.subnet_id for s in vpc.public_subnets]),
                 "ECS_SECURITY_GROUP_IDS": ecs_security_group.security_group_id,
                 "ECS_CAPACITY_PROVIDER": capacity_provider.capacity_provider_name,
                 "OUTPUT_BUCKET": output_3d_bucket.bucket_name,

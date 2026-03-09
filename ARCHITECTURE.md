@@ -14,7 +14,7 @@
 | コンピュート   | AWS Lambda                      |
 | ストレージ     | Amazon S3 (5 バケット: userimage / metadata / athena-results / 3d-output / thumbnails) |
 | クエリエンジン | Amazon Athena (Engine v3)       |
-| 3D 再構築      | GPU 付き EC2 (ECS EC2 起動タイプ + オンデマンドインスタンス) |
+| 3D 再構築      | GPU 付き EC2 (ECS EC2 起動タイプ + オンデマンドインスタンス、パブリックサブネット配置) |
 | ジョブ起動     | AWS Lambda (S3 イベント → 判定 → ECS タスク起動) |
 
 > **Note**: Athena は内部的に AWS Glue Data Catalog をメタストアとして使用するが、Glue Crawler や Glue ETL ジョブは使用しない。テーブル定義は CDK で Glue テーブルリソースとして管理する。2 つの Glue テーブル (`image_metadata_raw` / `image_metadata_compacted`) を定義し、検索時は `UNION ALL` で横断クエリする。
@@ -431,7 +431,7 @@ S3 の条件付き PUT (`If-None-Match: *`) を使用したロック方式を採
 >
 > **ECS タスク起動**: `run_task` API では `launchType=EC2` ではなく `capacityProviderStrategy` を指定する。Capacity Provider の Managed Scaling により、タスク配置時に ASG が自動的にインスタンスをスケールアップする。`launchType` と `capacityProviderStrategy` は排他的パラメータであり、両方指定するとエラーになる。
 >
-> **ネットワーク**: EC2 起動タイプ + awsvpc ネットワークモードでは `assignPublicIp=DISABLED` を指定する。パブリック IP は EC2 インスタンスレベルで管理され、タスクレベルでの指定は非対応。
+> **ネットワーク**: EC2 インスタンスはパブリックサブネットに配置し、パブリック IP を自動割り当てする。セキュリティグループでインバウンドを全拒否し、アウトバウンドのみ許可する。EC2 launch type + awsvpc ネットワークモードでは、タスク ENI にはパブリック IP が付かない (`assignPublicIp` は Fargate 専用パラメータで、EC2 launch type では `ENABLED` を指定すると `InvalidParameterException` が発生する)。そのため **S3 Gateway VPC エンドポイント**を VPC に追加し、タスク ENI から S3 へのアクセスを AWS バックボーン経由で確保する。ECR からのイメージプルは EC2 インスタンスのパブリック IP 経由、CloudWatch Logs 等はタスク ENI のアウトバウンド経由で到達する。
 
 | 項目 | 設定 |
 | --- | --- |
@@ -454,12 +454,16 @@ S3 の条件付き PUT (`If-None-Match: *`) を使用したロック方式を採
 
 GPU インスタンス (`g4dn.xlarge`: オンデマンド $0.526/h) をオンデマンドで使用する。Capacity Provider の Managed Scaling により、タスクがないときは ASG が 0 台にスケールインするため、アイドル時のコストはゼロ。
 
+EC2 インスタンスはパブリックサブネットに直接配置し、NAT Gateway を使用しない。これにより NAT Gateway の固定費 (~$32/月) を削減する。AWS サービスへの通信は、S3 については VPC Gateway エンドポイント (無料) 経由、その他 (ECR, ECS, CloudWatch Logs) は EC2 インスタンスのパブリック IP 経由で直接行う。セキュリティグループでインバウンドを全拒否することでセキュリティを確保する。
+
 **コスト見積もり**:
 
 | 項目 | 費用 |
 | --- | --- |
 | `g4dn.xlarge` 単価 | $0.526/h |
 | 1 ジョブ (4 時間想定) | $2.10 |
+| NAT Gateway | 不要 ($0) |
+| S3 VPC Endpoint | Gateway 型のため無料 ($0) |
 
 > **Note**: 将来的にジョブ量が増加しコスト削減が必要になった場合は、Spot インスタンスへの移行を検討する。
 
@@ -792,8 +796,8 @@ WHERE gps_latitude BETWEEN :south AND :north
 | キー構造           | `{user_id}/{uuid_v6}/{original_filename}.jpg`                                              |
 | パブリックアクセス | 全ブロック                                                                                 |
 | 暗号化             | SSE-S3 (デフォルト)                                                                        |
-| バージョニング     | 有効 (誤削除防止)                                                                          |
-| ライフサイクル     | 非現行バージョンを 1 日後に自動削除 (`noncurrent_version_expiration=Duration.days(1)`)。`cdk destroy` 時に非現行バージョンが残らないようにするため |
+| バージョニング     | 無効 (メタデータから再生成情報は得られるが、画像そのものは再生成不可。運用上、誤削除リスクよりバージョニングのコストとクリーンアップの複雑さを排除する判断) |
+| ライフサイクル     | なし |
 | CORS               | クライアントからの PUT アップロードを許可                                                  |
 | イベント通知       | `s3:ObjectCreated:*` → メタデータ抽出 Lambda / `s3:ObjectRemoved:*` → クリーンアップ Lambda |
 | 削除ポリシー       | `RemovalPolicy.DESTROY` + `auto_delete_objects=True` (開発環境)。`cdk destroy` で全オブジェクト・全バージョンを含めて削除 |
@@ -894,13 +898,13 @@ cdk destroy --all
 
 | リソース | 挙動 | 注意点 |
 | --- | --- | --- |
-| S3 バケット (全5バケット) | `RemovalPolicy.DESTROY` + `auto_delete_objects=True` で全オブジェクト・バージョンごと削除 | 画像バケットはバージョニング有効のため、ライフサイクルルールで非現行バージョンを 1 日後に削除するよう設定済み。`cdk destroy` 直後は非現行バージョンが残る場合があるが CDK の `auto_delete_objects` カスタムリソースが全バージョンを削除する |
+| S3 バケット (全5バケット) | `RemovalPolicy.DESTROY` + `auto_delete_objects=True` で全オブジェクトごと削除 | 全バケットともバージョニング無効のため、非現行バージョンの残存は発生しない |
 | Cognito User Pool | `RemovalPolicy.DESTROY` を明示。デフォルトは `RETAIN` のため CDK コードで明示的に指定する | ユーザーデータが全て消える。本番環境では `RETAIN` に戻すこと |
 | Lambda 関数 | スタック削除と同時に削除 | 問題なし |
 | API Gateway | スタック削除と同時に削除 | 問題なし |
 | ECS クラスター / タスク定義 | タスクが実行中だと削除に失敗する | `cdk destroy` 前に実行中の ECS タスクを停止すること (`aws ecs list-tasks` → `aws ecs stop-task`) |
 | EC2 Auto Scaling Group | ASG の削除前にインスタンスが終了される | 終了完了まで数分かかる場合がある |
-| VPC / サブネット / セキュリティグループ | ENI が残っていると削除に失敗する | ECS タスク停止後に削除すること |
+| VPC / サブネット / セキュリティグループ | ENI が残っていると削除に失敗する | ECS タスク停止後に削除すること。パブリックサブネットのみの構成 (NAT Gateway なし、S3 VPC Gateway エンドポイントあり) のため、NAT 関連のリソース残存は発生しない |
 | Athena Workgroup / Glue テーブル | スタック削除と同時に削除 | 問題なし |
 | ECR リポジトリ | `RemovalPolicy.DESTROY` を指定。デフォルトは `RETAIN` | イメージごと削除される |
 
