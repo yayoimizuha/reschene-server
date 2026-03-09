@@ -11,7 +11,7 @@ import json
 import os
 import sys
 import time
-import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 import requests
@@ -23,6 +23,7 @@ USERNAME = "testuser@reschene.example.com"
 PASSWORD = "TestPass123!"
 
 JPEG_DIR = os.path.join(os.path.dirname(__file__), "..", "グラウンド前_jpeg")
+MAX_WORKERS = 20
 
 
 def get_token() -> str:
@@ -50,23 +51,24 @@ def get_presigned_urls(token: str, filenames: list[str]) -> dict:
         raise RuntimeError(f"Failed to get presigned URLs: {resp.status_code} {resp.text}")
 
     data = resp.json()
-    # Build map: filename -> {presigned_url, s3_key}
     url_map = {}
     for item in data.get("urls", []):
         url_map[item["filename"]] = item
-    return url_map
+    return data.get("upload_id", "N/A"), url_map
 
 
-def upload_image(presigned_url: str, filepath: str) -> int:
-    """Upload a single image using presigned URL."""
-    with open(filepath, "rb") as f:
-        file_data = f.read()
-
-    put_resp = requests.put(presigned_url, data=file_data, headers={"Content-Type": "image/jpeg"})
-    if put_resp.status_code not in (200, 204):
-        raise RuntimeError(f"Upload failed: {put_resp.status_code} {put_resp.text}")
-
-    return len(file_data)
+def upload_one(filepath: str, presigned_url: str) -> tuple[str, int | None, str | None]:
+    """Upload a single image. Returns (filename, size, error)."""
+    filename = os.path.basename(filepath)
+    try:
+        with open(filepath, "rb") as f:
+            file_data = f.read()
+        put_resp = requests.put(presigned_url, data=file_data, headers={"Content-Type": "image/jpeg"})
+        if put_resp.status_code not in (200, 204):
+            return filename, None, f"HTTP {put_resp.status_code}"
+        return filename, len(file_data), None
+    except Exception as e:
+        return filename, None, str(e)
 
 
 def main():
@@ -80,39 +82,45 @@ def main():
     token = get_token()
     print("Token acquired")
 
-    # Get presigned URLs for all files in one API call
     filenames = [os.path.basename(fp) for fp in jpeg_files]
     print(f"Requesting presigned URLs for {len(filenames)} files...")
-    url_map = get_presigned_urls(token, filenames)
-    print(f"Got {len(url_map)} presigned URLs")
+    upload_id, url_map = get_presigned_urls(token, filenames)
+    print(f"Got {len(url_map)} presigned URLs  (upload_id: {upload_id})")
+
+    # Build work items
+    work = []
+    for filepath in jpeg_files:
+        fn = os.path.basename(filepath)
+        info = url_map.get(fn)
+        if info:
+            work.append((filepath, info["presigned_url"]))
 
     success_count = 0
     fail_count = 0
+    total_bytes = 0
     start_time = time.time()
+    done = 0
 
-    for i, filepath in enumerate(jpeg_files):
-        filename = os.path.basename(filepath)
-        try:
-            info = url_map.get(filename)
-            if not info:
-                raise RuntimeError(f"No presigned URL for {filename}")
-            size = upload_image(info["presigned_url"], filepath)
-            success_count += 1
+    print(f"Uploading with {MAX_WORKERS} parallel workers...")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(upload_one, fp, url): fp for fp, url in work}
+        for future in as_completed(futures):
+            done += 1
+            filename, size, error = future.result()
             elapsed = time.time() - start_time
-            print(f"  [{i + 1}/{len(jpeg_files)}] OK: {filename} ({size:,} bytes) [{elapsed:.1f}s]")
-        except Exception as e:
-            fail_count += 1
-            print(f"  [{i + 1}/{len(jpeg_files)}] FAIL: {filename} - {e}")
-
-        # Small delay to avoid throttling
-        if (i + 1) % 10 == 0:
-            time.sleep(0.5)
+            if error:
+                fail_count += 1
+                print(f"  [{done}/{len(work)}] FAIL: {filename} - {error}  [{elapsed:.1f}s]")
+            else:
+                success_count += 1
+                total_bytes += size or 0
+                # Print progress every 10 files or on the last one
+                if done % 10 == 0 or done == len(work):
+                    print(f"  [{done}/{len(work)}] {success_count} ok / {fail_count} fail  [{elapsed:.1f}s]")
 
     total_time = time.time() - start_time
-    print(f"\nDone in {total_time:.1f}s: {success_count} success, {fail_count} failed")
-    print(
-        f"Upload ID from API: {url_map.get(filenames[0], {}).get('s3_key', 'N/A').split('/')[1] if url_map else 'N/A'}"
-    )
+    print(f"\nDone in {total_time:.1f}s: {success_count} success, {fail_count} failed, {total_bytes:,} bytes total")
+    print(f"Upload ID: {upload_id}")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,17 @@
 """Cleanup Lambda handler.
 
-Triggered by S3 ObjectRemoved events. Removes the corresponding metadata
-line from the user's JSONL file and deletes the thumbnail.
+Triggered by S3 ObjectRemoved events. Deletes the corresponding
+per-image metadata JSON file and the thumbnail.
+
+Metadata files live at:
+    raw/{user_id}/{upload_id}/{filename}.metadata.json
+
+If the record has already been compacted into Parquet, it will be
+excluded at the next compaction run (the source image no longer
+exists, so the compaction job can filter it out — or the record
+simply remains in the historical Parquet as a tombstone-free design).
 """
 
-import json
 import logging
 import os
 from urllib.parse import unquote_plus
@@ -33,9 +40,11 @@ def handler(event, context):
             return
 
         user_id = parts[0]
+        upload_id = parts[1]
+        original_filename = parts[2]
 
-        # Remove from JSONL
-        _remove_from_jsonl(user_id, s3_key)
+        # Delete per-image metadata JSON
+        _delete_metadata(user_id, upload_id, original_filename)
 
         # Delete thumbnail (ignore if not exists)
         _delete_thumbnail(s3_key)
@@ -43,49 +52,14 @@ def handler(event, context):
     return {"statusCode": 200}
 
 
-def _remove_from_jsonl(user_id: str, s3_key: str) -> None:
-    """Remove the metadata line matching s3_key from the user's JSONL file."""
-    jsonl_key = f"{user_id}/metadata.jsonl"
-
+def _delete_metadata(user_id: str, upload_id: str, filename: str) -> None:
+    """Delete the individual metadata JSON file for the removed image."""
+    metadata_key = f"raw/{user_id}/{upload_id}/{filename}.metadata.json"
     try:
-        response = s3_client.get_object(Bucket=METADATA_BUCKET, Key=jsonl_key)
-        content = response["Body"].read().decode("utf-8")
-    except s3_client.exceptions.NoSuchKey:
-        logger.info("JSONL file not found (already deleted): %s", jsonl_key)
-        return
-
-    lines = content.strip().split("\n") if content.strip() else []
-    filtered_lines = []
-    found = False
-
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-            if record.get("s3_key") == s3_key:
-                found = True
-                continue
-            filtered_lines.append(line)
-        except json.JSONDecodeError:
-            # Keep malformed lines to avoid data loss
-            filtered_lines.append(line)
-
-    if not found:
-        logger.info("No matching record found for s3_key=%s (idempotent)", s3_key)
-        return
-
-    updated_content = "\n".join(filtered_lines)
-    if updated_content:
-        updated_content += "\n"
-
-    s3_client.put_object(
-        Bucket=METADATA_BUCKET,
-        Key=jsonl_key,
-        Body=updated_content.encode("utf-8"),
-        ContentType="application/jsonlines",
-    )
-    logger.info("Removed record for %s from %s", s3_key, jsonl_key)
+        s3_client.delete_object(Bucket=METADATA_BUCKET, Key=metadata_key)
+        logger.info("Metadata deleted: s3://%s/%s", METADATA_BUCKET, metadata_key)
+    except Exception:
+        logger.warning("Failed to delete metadata for %s (may not exist)", metadata_key, exc_info=True)
 
 
 def _delete_thumbnail(s3_key: str) -> None:

@@ -1,8 +1,14 @@
 """Metadata extraction Lambda handler.
 
 Triggered by S3 ObjectCreated events. Extracts EXIF metadata,
-generates thumbnails, writes JSONL, and optionally invokes the
-3D reconstruction judge Lambda.
+generates thumbnails, writes per-image metadata JSON to S3,
+and optionally invokes the 3D reconstruction judge Lambda.
+
+Metadata is written as individual JSON files under:
+    raw/{user_id}/{upload_id}/{filename}.metadata.json
+
+A separate compaction job periodically merges raw files into
+Parquet for efficient Athena queries.
 """
 
 import io
@@ -71,8 +77,8 @@ def handler(event, context):
             "gps_altitude": exif_data.get("gps_altitude"),
         }
 
-        # Append to JSONL
-        _append_to_jsonl(user_id, metadata)
+        # Write metadata as individual file (race-condition-free)
+        _write_metadata(user_id, upload_id, original_filename, metadata)
 
         # Invoke 3D reconstruction judge (async) if GPS data present
         if (
@@ -205,32 +211,23 @@ def _generate_thumbnail(image_bytes: bytes, s3_key: str) -> None:
         logger.warning("Thumbnail generation failed for %s", s3_key, exc_info=True)
 
 
-def _append_to_jsonl(user_id: str, metadata: dict) -> None:
-    """Append a metadata record to the user's JSONL file."""
-    jsonl_key = f"{user_id}/metadata.jsonl"
+def _write_metadata(user_id: str, upload_id: str, filename: str, metadata: dict) -> None:
+    """Write a metadata record as an individual JSON file.
 
-    # GET existing JSONL
-    existing_content = ""
-    try:
-        response = s3_client.get_object(Bucket=METADATA_BUCKET, Key=jsonl_key)
-        existing_content = response["Body"].read().decode("utf-8")
-    except s3_client.exceptions.NoSuchKey:
-        pass  # First upload for this user
+    Key format: raw/{user_id}/{upload_id}/{filename}.metadata.json
 
-    # Append new line
-    new_line = json.dumps(metadata, ensure_ascii=False)
-    if existing_content and not existing_content.endswith("\n"):
-        existing_content += "\n"
-    updated_content = existing_content + new_line + "\n"
-
-    # PUT back
+    Each Lambda writes to a unique key, so there is zero contention.
+    A separate compaction job merges these into Parquet periodically.
+    """
+    key = f"raw/{user_id}/{upload_id}/{filename}.metadata.json"
+    body = json.dumps(metadata, ensure_ascii=False) + "\n"
     s3_client.put_object(
         Bucket=METADATA_BUCKET,
-        Key=jsonl_key,
-        Body=updated_content.encode("utf-8"),
-        ContentType="application/jsonlines",
+        Key=key,
+        Body=body.encode("utf-8"),
+        ContentType="application/json",
     )
-    logger.info("Metadata appended to s3://%s/%s", METADATA_BUCKET, jsonl_key)
+    logger.info("Metadata written to s3://%s/%s", METADATA_BUCKET, key)
 
 
 def _invoke_reconstruction_judge(s3_key: str, user_id: str, lat: float, lon: float) -> None:

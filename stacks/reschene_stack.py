@@ -184,7 +184,9 @@ class RescheneStack(cdk.Stack):
         # 3. Analytics (Athena + Glue)
         # ================================================================
         database_name = "reschene"
-        table_name = "image_metadata"
+        raw_table_name = "image_metadata_raw"
+        compacted_table_name = "image_metadata_compacted"
+        view_name = "image_metadata"
         workgroup_name = "reschene-workgroup"
 
         glue_database = glue.CfnDatabase(
@@ -197,34 +199,36 @@ class RescheneStack(cdk.Stack):
             ),
         )
 
-        glue_table = glue.CfnTable(
+        # Column definitions shared by both tables
+        metadata_columns = [
+            glue.CfnTable.ColumnProperty(name="user_id", type="string"),
+            glue.CfnTable.ColumnProperty(name="s3_key", type="string"),
+            glue.CfnTable.ColumnProperty(name="upload_id", type="string"),
+            glue.CfnTable.ColumnProperty(name="original_filename", type="string"),
+            glue.CfnTable.ColumnProperty(name="file_size", type="bigint"),
+            glue.CfnTable.ColumnProperty(name="uploaded_at", type="string"),
+            glue.CfnTable.ColumnProperty(name="camera_make", type="string"),
+            glue.CfnTable.ColumnProperty(name="camera_model", type="string"),
+            glue.CfnTable.ColumnProperty(name="datetime_original", type="string"),
+            glue.CfnTable.ColumnProperty(name="gps_latitude", type="double"),
+            glue.CfnTable.ColumnProperty(name="gps_longitude", type="double"),
+            glue.CfnTable.ColumnProperty(name="gps_altitude", type="double"),
+        ]
+
+        # Raw table: per-image JSON files written by metadata_extraction Lambda
+        raw_table = glue.CfnTable(
             self,
-            "GlueTable",
+            "GlueTableRaw",
             catalog_id=self.account,
             database_name=database_name,
             table_input=glue.CfnTable.TableInputProperty(
-                name=table_name,
-                description="Image metadata table (non-partitioned, cross-user queries supported)",
+                name=raw_table_name,
+                description="Raw per-image metadata JSON files (pre-compaction)",
                 table_type="EXTERNAL_TABLE",
-                parameters={
-                    "classification": "json",
-                },
+                parameters={"classification": "json"},
                 storage_descriptor=glue.CfnTable.StorageDescriptorProperty(
-                    columns=[
-                        glue.CfnTable.ColumnProperty(name="user_id", type="string"),
-                        glue.CfnTable.ColumnProperty(name="s3_key", type="string"),
-                        glue.CfnTable.ColumnProperty(name="upload_id", type="string"),
-                        glue.CfnTable.ColumnProperty(name="original_filename", type="string"),
-                        glue.CfnTable.ColumnProperty(name="file_size", type="bigint"),
-                        glue.CfnTable.ColumnProperty(name="uploaded_at", type="string"),
-                        glue.CfnTable.ColumnProperty(name="camera_make", type="string"),
-                        glue.CfnTable.ColumnProperty(name="camera_model", type="string"),
-                        glue.CfnTable.ColumnProperty(name="datetime_original", type="string"),
-                        glue.CfnTable.ColumnProperty(name="gps_latitude", type="double"),
-                        glue.CfnTable.ColumnProperty(name="gps_longitude", type="double"),
-                        glue.CfnTable.ColumnProperty(name="gps_altitude", type="double"),
-                    ],
-                    location=f"s3://{metadata_bucket.bucket_name}/",
+                    columns=metadata_columns,
+                    location=f"s3://{metadata_bucket.bucket_name}/raw/",
                     input_format="org.apache.hadoop.mapred.TextInputFormat",
                     output_format="org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
                     serde_info=glue.CfnTable.SerdeInfoProperty(
@@ -233,7 +237,31 @@ class RescheneStack(cdk.Stack):
                 ),
             ),
         )
-        glue_table.add_dependency(glue_database)
+        raw_table.add_dependency(glue_database)
+
+        # Compacted table: Parquet file(s) produced by compaction Lambda
+        compacted_table = glue.CfnTable(
+            self,
+            "GlueTableCompacted",
+            catalog_id=self.account,
+            database_name=database_name,
+            table_input=glue.CfnTable.TableInputProperty(
+                name=compacted_table_name,
+                description="Compacted image metadata in Parquet format",
+                table_type="EXTERNAL_TABLE",
+                parameters={"classification": "parquet"},
+                storage_descriptor=glue.CfnTable.StorageDescriptorProperty(
+                    columns=metadata_columns,
+                    location=f"s3://{metadata_bucket.bucket_name}/compacted/",
+                    input_format="org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                    output_format="org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                    serde_info=glue.CfnTable.SerdeInfoProperty(
+                        serialization_library="org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                    ),
+                ),
+            ),
+        )
+        compacted_table.add_dependency(glue_database)
 
         athena_workgroup = athena.CfnWorkGroup(
             self,
@@ -396,7 +424,8 @@ class RescheneStack(cdk.Stack):
                 "IMAGE_BUCKET": image_bucket.bucket_name,
                 "ATHENA_WORKGROUP": workgroup_name,
                 "GLUE_DATABASE": database_name,
-                "GLUE_TABLE": table_name,
+                "GLUE_TABLE_RAW": raw_table_name,
+                "GLUE_TABLE_COMPACTED": compacted_table_name,
             },
         )
 
@@ -526,6 +555,42 @@ class RescheneStack(cdk.Stack):
             s3n.LambdaDestination(cleanup_function),
         )
 
+        # Compaction Lambda (merges raw per-image JSON → Parquet)
+        compaction_function = lambda_.Function(
+            self,
+            "CompactionFunction",
+            function_name="reschene-compaction",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset(
+                "lambdas/compaction",
+                bundling=cdk.BundlingOptions(
+                    image=lambda_.Runtime.PYTHON_3_12.bundling_image,
+                    command=[
+                        "bash",
+                        "-c",
+                        "pip install -r requirements.txt -t /asset-output && cp -au . /asset-output",
+                    ],
+                ),
+            ),
+            memory_size=1024,
+            timeout=cdk.Duration.minutes(5),
+            environment={
+                "METADATA_BUCKET": metadata_bucket.bucket_name,
+            },
+        )
+
+        metadata_bucket.grant_read_write(compaction_function)
+
+        # EventBridge Rule: run compaction daily at 03:00 UTC
+        compaction_schedule = events.Rule(
+            self,
+            "CompactionSchedule",
+            rule_name="reschene-compaction-daily",
+            schedule=events.Schedule.cron(minute="0", hour="3"),
+            targets=[events_targets.LambdaFunction(compaction_function)],
+        )
+
         # ================================================================
         # 6. API Gateway
         # ================================================================
@@ -583,7 +648,8 @@ class RescheneStack(cdk.Stack):
             environment={
                 "ATHENA_WORKGROUP": workgroup_name,
                 "GLUE_DATABASE": database_name,
-                "GLUE_TABLE": table_name,
+                "GLUE_TABLE_RAW": raw_table_name,
+                "GLUE_TABLE_COMPACTED": compacted_table_name,
                 "ATHENA_RESULTS_BUCKET": athena_results_bucket.bucket_name,
             },
         )

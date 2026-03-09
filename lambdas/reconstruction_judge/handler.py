@@ -27,7 +27,8 @@ OUTPUT_BUCKET = os.environ["OUTPUT_BUCKET"]
 IMAGE_BUCKET = os.environ["IMAGE_BUCKET"]
 ATHENA_WORKGROUP = os.environ["ATHENA_WORKGROUP"]
 GLUE_DATABASE = os.environ["GLUE_DATABASE"]
-GLUE_TABLE = os.environ["GLUE_TABLE"]
+GLUE_TABLE_RAW = os.environ["GLUE_TABLE_RAW"]
+GLUE_TABLE_COMPACTED = os.environ["GLUE_TABLE_COMPACTED"]
 
 athena_client = boto3.client("athena")
 ecs_client = boto3.client("ecs")
@@ -95,10 +96,12 @@ def handler(event, context):
 
 def _count_images_in_region(lat: float, lon: float, radius_m: float) -> int:
     """Count GPS-tagged images within radius using Athena (cross-user)."""
-    table = f'"{GLUE_DATABASE}"."{GLUE_TABLE}"'
+    raw = f'"{GLUE_DATABASE}"."{GLUE_TABLE_RAW}"'
+    compacted = f'"{GLUE_DATABASE}"."{GLUE_TABLE_COMPACTED}"'
+    source = f"(SELECT * FROM {raw} UNION ALL SELECT * FROM {compacted}) AS t"
     sql = f"""
         SELECT COUNT(*) AS image_count
-        FROM {table}
+        FROM {source}
         WHERE gps_latitude IS NOT NULL
           AND gps_longitude IS NOT NULL
           AND ST_DISTANCE(

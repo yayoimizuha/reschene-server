@@ -2,6 +2,9 @@
 
 Handles POST /search requests. Builds Athena SQL based on search type
 and returns results.
+
+Queries both raw (per-image JSON) and compacted (Parquet) Glue tables
+using UNION ALL to provide a unified view of all metadata.
 """
 
 import json
@@ -16,7 +19,8 @@ logger.setLevel(logging.INFO)
 
 ATHENA_WORKGROUP = os.environ["ATHENA_WORKGROUP"]
 GLUE_DATABASE = os.environ["GLUE_DATABASE"]
-GLUE_TABLE = os.environ["GLUE_TABLE"]
+GLUE_TABLE_RAW = os.environ["GLUE_TABLE_RAW"]
+GLUE_TABLE_COMPACTED = os.environ["GLUE_TABLE_COMPACTED"]
 ATHENA_RESULTS_BUCKET = os.environ["ATHENA_RESULTS_BUCKET"]
 
 athena_client = boto3.client("athena")
@@ -24,6 +28,22 @@ athena_client = boto3.client("athena")
 # Max wait time for Athena query (seconds)
 QUERY_TIMEOUT = 30
 POLL_INTERVAL = 0.5
+
+
+def _unified_source() -> str:
+    """Return a UNION ALL subquery that merges raw + compacted tables.
+
+    Records in raw/ that have already been compacted will be deduplicated
+    naturally: once the compaction job runs, it deletes the raw files, so
+    the raw table only contains not-yet-compacted records.
+    """
+    raw = f'"{GLUE_DATABASE}"."{GLUE_TABLE_RAW}"'
+    compacted = f'"{GLUE_DATABASE}"."{GLUE_TABLE_COMPACTED}"'
+    return f"""(
+        SELECT * FROM {raw}
+        UNION ALL
+        SELECT * FROM {compacted}
+    )"""
 
 
 def handler(event, context):
@@ -60,7 +80,7 @@ def handler(event, context):
 
 def _build_query(search_type: str, body: dict, caller_user_id: str) -> str:
     """Build Athena SQL based on search type."""
-    table = f'"{GLUE_DATABASE}"."{GLUE_TABLE}"'
+    source = _unified_source()
 
     if search_type == "geo_radius":
         lat = body.get("latitude")
@@ -77,7 +97,7 @@ def _build_query(search_type: str, body: dict, caller_user_id: str) -> str:
                     to_spherical_geography(ST_POINT(gps_longitude, gps_latitude)),
                     to_spherical_geography(ST_POINT({lon}, {lat}))
                 ) / 1000.0 AS distance_km
-            FROM {table}
+            FROM {source} AS t
             WHERE gps_latitude IS NOT NULL
               AND gps_longitude IS NOT NULL
               AND ST_DISTANCE(
@@ -91,7 +111,7 @@ def _build_query(search_type: str, body: dict, caller_user_id: str) -> str:
         user_id = body.get("user_id", caller_user_id)
         return f"""
             SELECT s3_key, original_filename, uploaded_at, gps_latitude, gps_longitude
-            FROM {table}
+            FROM {source} AS t
             WHERE user_id = '{user_id}'
             ORDER BY uploaded_at DESC
         """
@@ -102,7 +122,7 @@ def _build_query(search_type: str, body: dict, caller_user_id: str) -> str:
             raise ValueError("batch requires 'upload_id'")
         return f"""
             SELECT s3_key, original_filename, uploaded_at
-            FROM {table}
+            FROM {source} AS t
             WHERE user_id = '{caller_user_id}'
               AND upload_id = '{upload_id}'
             ORDER BY original_filename
