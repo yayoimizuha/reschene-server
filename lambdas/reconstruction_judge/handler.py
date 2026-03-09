@@ -5,7 +5,6 @@ Checks if sufficient GPS-tagged images exist in a region and
 triggers an ECS task for 3D reconstruction.
 """
 
-import hashlib
 import json
 import logging
 import os
